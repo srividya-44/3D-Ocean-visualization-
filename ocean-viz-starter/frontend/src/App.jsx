@@ -4,7 +4,7 @@ import Sliders from "./components/Sliders.jsx";
 import ProfileChart from "./components/ProfileChart.jsx";
 import GridPointInfo from "./components/GridPointInfo.jsx";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE;
 
 export default function App() {
   const [meta, setMeta] = useState(null);

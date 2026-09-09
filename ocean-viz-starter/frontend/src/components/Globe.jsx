@@ -5,7 +5,7 @@ import "cesium/Build/Cesium/Widgets/widgets.css";
 // Get a free token from https://ion.cesium.com/tokens and paste it here.
 Cesium.Ion.defaultAccessToken = import.meta.env.VITE_CESIUM_TOKEN;
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE;
 
 // Turn a temperature value into a color: blue (cold) -> yellow -> red (hot).
 // min/max are computed dynamically per-slice (see loadTemperatureLayer)

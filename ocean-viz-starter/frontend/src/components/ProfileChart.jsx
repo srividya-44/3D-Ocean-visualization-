@@ -11,7 +11,7 @@ import {
 // to use the depth values as x-axis labels.
 ChartJS.register(LineElement, PointElement, LinearScale, CategoryScale, Tooltip, Legend, Title);
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE;
 
 export default function ProfileChart({ floatId, onClose }) {
   const [mismatchData, setMismatchData] = useState(null);
