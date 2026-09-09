@@ -2,27 +2,40 @@ import { useEffect, useRef } from "react";
 import * as Cesium from "cesium";
 import "cesium/Build/Cesium/Widgets/widgets.css";
 
+// Get a free token from https://ion.cesium.com/tokens and paste it here.
+Cesium.Ion.defaultAccessToken ="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6Ii1NSHl1d0FtaWZNRXFubW0iLCJqdGkiOiJhMzY1YWZlOC01OTU0LTRmYmQtYjE1Yi0zN2U5Y2ZhNjEzZDIiLCJpZCI6NDg0MzM1LCJpc3MiOiJodHRwczovL2FwaS5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3ODg5MzU2Mjh9.k89nvJ8OiPUJx2Fqno85hfB_xUoyYtdbdO4jRv-e5-k";
+
 const API_BASE = "http://localhost:8000";
 
-// Turn a temperature value into a color: blue (cold) -> red (hot).
-// This is the simplest possible color scale -- good enough for a demo,
-// swap for a proper colormap (e.g. colorbrewer) if you have time later.
-function temperatureToColor(temp, min = 5, max = 30) {
-  const t = Math.min(1, Math.max(0, (temp - min) / (max - min)));
-  const r = Math.round(255 * t);
-  const b = Math.round(255 * (1 - t));
-  return Cesium.Color.fromBytes(r, 60, b, 200);
+// Turn a temperature value into a color: blue (cold) -> yellow -> red (hot).
+// min/max are computed dynamically per-slice (see loadTemperatureLayer)
+// so the color spread is always meaningful, whether you're looking at a
+// warm surface layer (26-31C) or a cold deep layer (5-10C).
+function temperatureToColor(temp, min, max) {
+  const t = Math.min(1, Math.max(0, (temp - min) / (max - min || 1)));
+  // Blue -> Cyan -> Yellow -> Red gradient (more informative than plain
+  // red-to-blue for a narrow real-world range like ocean surface temps)
+  let r, g, b;
+  if (t < 0.5) {
+    const k = t / 0.5;
+    r = Math.round(0 + k * 255);
+    g = Math.round(120 + k * 135);
+    b = Math.round(255 - k * 155);
+  } else {
+    const k = (t - 0.5) / 0.5;
+    r = 255;
+    g = Math.round(255 - k * 255);
+    b = Math.round(100 - k * 100);
+  }
+  return Cesium.Color.fromBytes(r, g, Math.max(0, b), 210);
 }
 
-export default function Globe({ time, depth, onFloatClick }) {
+export default function Globe({ time, depth, onFloatClick, onGridClick }) {
   const containerRef = useRef(null);
   const viewerRef = useRef(null);
   const modelEntitiesRef = useRef([]);
   const argoEntitiesRef = useRef([]);
 
-  // ------------------------------------------------------------
-  // Set up the CesiumJS viewer ONCE when the component mounts
-  // ------------------------------------------------------------
   useEffect(() => {
     const viewer = new Cesium.Viewer(containerRef.current, {
       timeline: false,
@@ -35,26 +48,24 @@ export default function Globe({ time, depth, onFloatClick }) {
       fullscreenButton: false,
     });
 
-    // Start the camera looking at the Bay of Bengal (matches sample data)
     viewer.camera.setView({
       destination: Cesium.Cartesian3.fromDegrees(85.0, 15.0, 1_500_000),
     });
 
     viewerRef.current = viewer;
 
-    // Load the Argo floats once (they don't change with the time/depth slider
-    // in this simple version -- their positions are fixed, only the
-    // profile/mismatch data changes)
     loadArgoFloats(viewer, onFloatClick).then((entities) => {
       argoEntitiesRef.current = entities;
     });
 
-    // Click handler: detect clicks on Argo float entities
     const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
     handler.setInputAction((movement) => {
       const picked = viewer.scene.pick(movement.position);
-      if (Cesium.defined(picked) && picked.id && picked.id.floatId) {
+      if (!Cesium.defined(picked) || !picked.id) return;
+      if (picked.id.floatId) {
         onFloatClick(picked.id.floatId);
+      } else if (picked.id.gridPoint) {
+        onGridClick(picked.id.gridPoint);
       }
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 
@@ -65,10 +76,6 @@ export default function Globe({ time, depth, onFloatClick }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ------------------------------------------------------------
-  // Re-fetch and re-draw the MODEL temperature layer whenever the
-  // time/depth slider changes
-  // ------------------------------------------------------------
   useEffect(() => {
     const viewer = viewerRef.current;
     if (!viewer) return;
@@ -76,19 +83,26 @@ export default function Globe({ time, depth, onFloatClick }) {
     fetch(`${API_BASE}/api/temperature?time=${time}&depth=${depth}`)
       .then((res) => res.json())
       .then((gridPoints) => {
-        // Remove the previous layer
         modelEntitiesRef.current.forEach((e) => viewer.entities.remove(e));
         modelEntitiesRef.current = [];
 
-        // Draw each grid point as a small colored box positioned at
-        // (lat, lon, -depth). Height is negative because CesiumJS
-        // treats "up" as positive, and depth goes down into the ocean.
+        if (gridPoints.length === 0) return;
+
+        // Compute the ACTUAL min/max temperature in this slice, so the
+        // color gradient always spans the real range instead of clipping
+        // everything to one end (which is what caused the uniform-orange
+        // look before).
+        const temps = gridPoints.map((p) => p.temperature);
+        const min = Math.min(...temps);
+        const max = Math.max(...temps);
+
         gridPoints.forEach((p) => {
           const entity = viewer.entities.add({
+            gridPoint: p, // custom property read by the click handler
             position: Cesium.Cartesian3.fromDegrees(p.lon, p.lat, -p.depth * 50),
             box: {
-              dimensions: new Cesium.Cartesian3(30000, 30000, 15000),
-              material: temperatureToColor(p.temperature),
+              dimensions: new Cesium.Cartesian3(25000, 25000, 12000),
+              material: temperatureToColor(p.temperature, min, max),
               outline: false,
             },
           });
@@ -101,11 +115,6 @@ export default function Globe({ time, depth, onFloatClick }) {
   return <div ref={containerRef} style={{ width: "100%", height: "100%" }} />;
 }
 
-// ------------------------------------------------------------
-// Load Argo floats as vertical "threads" (polylines) so their
-// FULL depth profile is visible directly in the 3D scene, not just
-// a single point at the surface.
-// ------------------------------------------------------------
 async function loadArgoFloats(viewer, onFloatClick) {
   const listRes = await fetch(`${API_BASE}/api/argo`);
   const floats = await listRes.json();
@@ -115,13 +124,12 @@ async function loadArgoFloats(viewer, onFloatClick) {
     const profileRes = await fetch(`${API_BASE}/api/argo/${f.float_id}`);
     const profile = await profileRes.json();
 
-    // Build a vertical line through all the float's depth readings
     const positions = profile.map((p) =>
       Cesium.Cartesian3.fromDegrees(p.lon, p.lat, -p.depth * 50)
     );
 
     const entity = viewer.entities.add({
-      floatId: f.float_id, // custom property used by the click handler
+      floatId: f.float_id,
       polyline: {
         positions,
         width: 6,

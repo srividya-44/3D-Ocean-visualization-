@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import Globe from "./components/Globe.jsx";
 import Sliders from "./components/Sliders.jsx";
 import ProfileChart from "./components/ProfileChart.jsx";
+import GridPointInfo from "./components/GridPointInfo.jsx";
 
 const API_BASE = "http://localhost:8000";
 
@@ -10,8 +11,8 @@ export default function App() {
   const [timeIndex, setTimeIndex] = useState(0);
   const [depthIndex, setDepthIndex] = useState(0);
   const [selectedFloat, setSelectedFloat] = useState(null);
+  const [selectedGridPoint, setSelectedGridPoint] = useState(null);
 
-  // Fetch available times/depths once at startup, to populate the sliders
   useEffect(() => {
     fetch(`${API_BASE}/api/meta`)
       .then((res) => res.json())
@@ -32,7 +33,14 @@ export default function App() {
       <Globe
         time={meta.times[timeIndex]}
         depth={meta.depths[depthIndex]}
-        onFloatClick={setSelectedFloat}
+        onFloatClick={(floatId) => {
+          setSelectedFloat(floatId);
+          setSelectedGridPoint(null); // don't show both popups at once
+        }}
+        onGridClick={(point) => {
+          setSelectedGridPoint(point);
+          setSelectedFloat(null);
+        }}
       />
 
       <Sliders
@@ -47,6 +55,11 @@ export default function App() {
       <ProfileChart
         floatId={selectedFloat}
         onClose={() => setSelectedFloat(null)}
+      />
+
+      <GridPointInfo
+        point={selectedGridPoint}
+        onClose={() => setSelectedGridPoint(null)}
       />
     </div>
   );

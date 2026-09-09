@@ -2,10 +2,14 @@ import { useEffect, useState } from "react";
 import { Line } from "react-chartjs-2";
 import {
   Chart as ChartJS, LineElement, PointElement,
-  LinearScale, Tooltip, Legend,
+  LinearScale, CategoryScale, Tooltip, Legend, Title,
 } from "chart.js";
 
-ChartJS.register(LineElement, PointElement, LinearScale, Tooltip, Legend);
+// Chart.js v4 requires every scale/element type used to be explicitly
+// registered. CategoryScale was missing before, which is what caused
+// the "category is not a registered scale" crash when the chart tried
+// to use the depth values as x-axis labels.
+ChartJS.register(LineElement, PointElement, LinearScale, CategoryScale, Tooltip, Legend, Title);
 
 const API_BASE = "http://localhost:8000";
 
@@ -14,6 +18,7 @@ export default function ProfileChart({ floatId, onClose }) {
 
   useEffect(() => {
     if (!floatId) return;
+    setMismatchData(null); // reset while loading the new float's data
     fetch(`${API_BASE}/api/mismatch/${floatId}?threshold=1.0`)
       .then((res) => res.json())
       .then(setMismatchData)
@@ -22,13 +27,21 @@ export default function ProfileChart({ floatId, onClose }) {
 
   if (!floatId) return null;
   if (!mismatchData) return <div style={panelStyle}>Loading {floatId}...</div>;
+  if (!mismatchData.comparison || mismatchData.comparison.length === 0) {
+    return (
+      <div style={panelStyle}>
+        <button onClick={onClose} style={closeButtonStyle}>✕</button>
+        <p>No comparable model data found for this float.</p>
+      </div>
+    );
+  }
 
   const depths = mismatchData.comparison.map((c) => c.depth);
   const observed = mismatchData.comparison.map((c) => c.observed_temperature);
   const modeled = mismatchData.comparison.map((c) => c.model_temperature);
 
   const chartData = {
-    labels: depths,
+    labels: depths.map((d) => `${d}m`),
     datasets: [
       {
         label: "Observed (Argo)",
@@ -49,11 +62,19 @@ export default function ProfileChart({ floatId, onClose }) {
     responsive: true,
     plugins: {
       legend: { labels: { color: "white" } },
-      title: { display: true, text: "Depth (m) vs. Temperature (°C)", color: "white" },
+      title: { display: true, text: "Depth vs. Temperature (°C)", color: "white" },
     },
     scales: {
-      x: { title: { display: true, text: "Depth (m)", color: "white" }, ticks: { color: "white" } },
-      y: { title: { display: true, text: "Temperature (°C)", color: "white" }, ticks: { color: "white" } },
+      x: {
+        type: "category",
+        title: { display: true, text: "Depth", color: "white" },
+        ticks: { color: "white" },
+      },
+      y: {
+        type: "linear",
+        title: { display: true, text: "Temperature (°C)", color: "white" },
+        ticks: { color: "white" },
+      },
     },
   };
 
@@ -62,19 +83,34 @@ export default function ProfileChart({ floatId, onClose }) {
       <button onClick={onClose} style={closeButtonStyle}>✕</button>
       <h3 style={{ marginTop: 0 }}>{floatId}</h3>
 
-      {mismatchData.any_mismatch ? (
-        <div style={mismatchBannerStyle}>
-          ⚠ Model and observation disagree by more than {mismatchData.threshold}°C
-          at one or more depths — this is exactly the kind of validation gap this
-          platform is built to surface immediately.
+      {mismatchData.severity === "high" && (
+        <div style={highAlertBannerStyle}>
+          🚨 <strong>HIGH DEVIATION ALERT</strong>
+          <p style={{ margin: "6px 0 0 0" }}>{mismatchData.alert_message}</p>
         </div>
-      ) : (
+      )}
+      {mismatchData.severity === "moderate" && (
+        <div style={moderateBannerStyle}>
+          ⚠ <strong>Moderate Deviation</strong>
+          <p style={{ margin: "6px 0 0 0" }}>{mismatchData.alert_message}</p>
+        </div>
+      )}
+      {mismatchData.severity === "normal" && (
         <div style={okBannerStyle}>
-          ✓ Model and observation agree within {mismatchData.threshold}°C at all depths.
+          ✓ <strong>Model Verified</strong>
+          <p style={{ margin: "6px 0 0 0" }}>{mismatchData.alert_message}</p>
         </div>
       )}
 
       <Line data={chartData} options={chartOptions} />
+
+      {mismatchData.depths_beyond_model_coverage > 0 && (
+        <p style={{ fontSize: 11, color: "#aaa", marginTop: 8 }}>
+          Note: {mismatchData.depths_beyond_model_coverage} deeper reading(s)
+          from this float are beyond the model data's coverage
+          (0–{mismatchData.max_model_depth}m) and are not shown above.
+        </p>
+      )}
 
       <table style={tableStyle}>
         <thead>
@@ -86,8 +122,8 @@ export default function ProfileChart({ floatId, onClose }) {
           </tr>
         </thead>
         <tbody>
-          {mismatchData.comparison.map((c) => (
-            <tr key={c.depth} style={c.mismatch ? { color: "#ff6b6b" } : {}}>
+          {mismatchData.comparison.map((c, i) => (
+            <tr key={i} style={c.mismatch ? { color: "#ff6b6b" } : {}}>
               <td>{c.depth}</td>
               <td>{c.observed_temperature}</td>
               <td>{c.model_temperature}</td>
@@ -129,6 +165,25 @@ const closeButtonStyle = {
 const mismatchBannerStyle = {
   background: "#5c1f1f",
   border: "1px solid #ff6b6b",
+  padding: 10,
+  borderRadius: 6,
+  fontSize: 13,
+  marginBottom: 12,
+};
+
+const highAlertBannerStyle = {
+  background: "#5c1414",
+  border: "2px solid #ff3b3b",
+  padding: 12,
+  borderRadius: 6,
+  fontSize: 13,
+  marginBottom: 12,
+  animation: "none",
+};
+
+const moderateBannerStyle = {
+  background: "#5c4a1f",
+  border: "1px solid #ffb74d",
   padding: 10,
   borderRadius: 6,
   fontSize: 13,

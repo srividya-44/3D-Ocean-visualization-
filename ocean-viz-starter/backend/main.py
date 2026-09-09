@@ -11,7 +11,6 @@ Then visit http://localhost:8000/docs for interactive API docs.
 """
 
 import json
-import math
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,17 +18,13 @@ from typing import Optional
 
 app = FastAPI(title="OceanScope3D API")
 
-# Allow the React dev server (usually localhost:5173) to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # for hackathon speed; restrict in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------
-# Load preprocessed data ONCE at startup
-# ---------------------------------------------------------------
 with open("data_processed/model_grid.json") as f:
     MODEL_DATA = json.load(f)
 
@@ -39,19 +34,21 @@ with open("data_processed/argo_profiles.json") as f:
 with open("data_processed/meta.json") as f:
     META = json.load(f)
 
+# The deepest depth level actually present in the downloaded model data.
+# Beyond this, we have NO real model data -- comparing an Argo reading
+# from e.g. 800m against the deepest available model layer (e.g. 205m)
+# would silently repeat the same stale value and produce a misleading
+# "mismatch" that isn't really about model accuracy, just missing data.
+MAX_MODEL_DEPTH = max((r["depth"] for r in MODEL_DATA), default=0)
+
 
 @app.get("/api/meta")
 def get_meta():
-    """Available times/depths so the frontend can build sliders."""
     return META
 
 
 @app.get("/api/temperature")
 def get_temperature(time: str = Query(...), depth: float = Query(...)):
-    """
-    Return the model grid (temperature + salinity) for one timestep and depth.
-    This is what gets drawn as the colored 3D layer in CesiumJS.
-    """
     results = [
         r for r in MODEL_DATA
         if r["time"] == time and abs(r["depth"] - depth) < 1e-6
@@ -63,10 +60,6 @@ def get_temperature(time: str = Query(...), depth: float = Query(...)):
 
 @app.get("/api/argo")
 def get_argo_floats():
-    """
-    Return one entry per float (its location + first depth reading),
-    so the frontend can plot markers on the globe.
-    """
     seen = {}
     for r in ARGO_DATA:
         if r["float_id"] not in seen:
@@ -81,10 +74,6 @@ def get_argo_floats():
 
 @app.get("/api/argo/{float_id}")
 def get_argo_profile(float_id: str):
-    """
-    Return the FULL vertical profile for one float (every depth reading).
-    Used for: (a) drawing the 3D vertical thread, (b) the Chart.js popup.
-    """
     profile = [r for r in ARGO_DATA if r["float_id"] == float_id]
     if not profile:
         raise HTTPException(status_code=404, detail="Float not found")
@@ -95,25 +84,18 @@ def _nearest_model_value(lat: float, lon: float, depth: float, time: str) -> Opt
     """
     Find the closest model grid point to a given (lat, lon, depth, time).
 
-    Real Argo depths (pressure readings) are continuous values (e.g. 5.2m,
-    10.7m) that won't exactly match the model's fixed depth levels (e.g.
-    0.49m, 1.54m, 2.65m...), so we match on the NEAREST depth, not an
-    exact one -- standard practice when comparing gridded model output
-    to point observations.
-
-    Similarly, an Argo float's reading might be from a date the model
-    snapshot doesn't have (e.g. only one model day was downloaded for
-    this prototype) -- so we fall back to the NEAREST available model
-    date rather than requiring an exact match.
+    Returns None if `depth` is beyond the deepest level our downloaded
+    model data actually covers (MAX_MODEL_DEPTH) -- rather than silently
+    matching against the deepest available layer, which would produce a
+    misleading flat/repeated comparison value.
     """
-    if not MODEL_DATA:
+    if not MODEL_DATA or depth > MAX_MODEL_DEPTH:
         return None
 
     available_times = sorted(set(r["time"] for r in MODEL_DATA))
     if time in available_times:
         nearest_time = time
     else:
-        # Pick whichever available model date is closest to the requested one
         target = pd.Timestamp(time)
         nearest_time = min(available_times, key=lambda t: abs(pd.Timestamp(t) - target))
 
@@ -129,24 +111,36 @@ def get_mismatch(float_id: str, threshold: float = 1.0):
     """
     THE KEY DIFFERENTIATOR FEATURE.
 
-    For every depth in this float's profile, compare its OBSERVED
-    temperature against the nearest MODEL-predicted temperature at the
-    same depth/time. Flag points where they disagree by more than
-    `threshold` degrees.
+    For every depth in this float's profile that falls WITHIN the range
+    our model data actually covers, compare its observed temperature
+    against the nearest model-predicted temperature at the same
+    depth/time, and flag disagreements beyond `threshold` degrees.
 
-    This is what proves real usability: a forecaster can instantly see
-    where the model and reality disagree, instead of manually
-    cross-checking two separate tools.
+    Also classifies overall SEVERITY so a forecaster gets an immediate
+    verdict, not just a table of numbers:
+        normal   -> max deviation < threshold
+        moderate -> max deviation between threshold and 2x threshold
+        high     -> max deviation >= 2x threshold (flagged as an alert --
+                    this magnitude of model/observation disagreement is
+                    the kind of thing that would prompt a forecaster to
+                    manually double check the forecast before relying on it)
     """
     profile = [r for r in ARGO_DATA if r["float_id"] == float_id]
     if not profile:
         raise HTTPException(status_code=404, detail="Float not found")
 
     comparison = []
+    beyond_model_range = 0
+
     for obs in profile:
+        if obs["depth"] > MAX_MODEL_DEPTH:
+            beyond_model_range += 1
+            continue
+
         model_point = _nearest_model_value(obs["lat"], obs["lon"], obs["depth"], obs["time"])
         if model_point is None:
             continue
+
         diff = round(obs["temperature"] - model_point["temperature"], 2)
         comparison.append({
             "depth": obs["depth"],
@@ -156,11 +150,40 @@ def get_mismatch(float_id: str, threshold: float = 1.0):
             "mismatch": abs(diff) > threshold,
         })
 
+    max_abs_diff = max((abs(c["difference"]) for c in comparison), default=0.0)
+
+    if max_abs_diff >= 2 * threshold:
+        severity = "high"
+        alert_message = (
+            f"ALERT: observed and modeled temperature disagree by up to "
+            f"{max_abs_diff}\u00b0C at this location -- a deviation this large "
+            f"means the model forecast at this point should not be relied on "
+            f"without manual review. Recommend flagging for forecaster attention."
+        )
+    elif max_abs_diff >= threshold:
+        severity = "moderate"
+        alert_message = (
+            f"Moderate deviation detected (up to {max_abs_diff}\u00b0C). "
+            f"Model is broadly reliable here but showing some drift -- "
+            f"worth monitoring, not yet a critical concern."
+        )
+    else:
+        severity = "normal"
+        alert_message = (
+            f"Model and observation agree closely (max deviation "
+            f"{max_abs_diff}\u00b0C). Forecast can be trusted at this location."
+        )
+
     return {
         "float_id": float_id,
         "threshold": threshold,
+        "max_model_depth": MAX_MODEL_DEPTH,
         "comparison": comparison,
         "any_mismatch": any(c["mismatch"] for c in comparison),
+        "depths_beyond_model_coverage": beyond_model_range,
+        "max_abs_diff": max_abs_diff,
+        "severity": severity,
+        "alert_message": alert_message,
     }
 
 

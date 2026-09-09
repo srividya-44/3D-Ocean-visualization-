@@ -4,19 +4,9 @@ preprocess.py
 Converts the raw scientific files (NetCDF model output + Argo/glider CSV)
 into lightweight, web-ready JSON files.
 
-WHY: browsers cannot read NetCDF directly, and re-parsing large NetCDF
-files on every API request would be slow. We do the heavy read ONCE
-here, and the FastAPI server just serves the resulting JSON.
-
---- UPDATED for real Copernicus Marine (CMEMS) data ---
-Real CMEMS files use these names (different from the original fake
-sample data, which used lowercase 'temperature'/'lat'/'lon'):
-    thetao      -> potential temperature (degC)
-    so          -> salinity (psu)
-    latitude    -> (full word, not 'lat')
-    longitude   -> (full word, not 'lon')
-    depth       -> same name, in meters
-    time        -> same name
+--- v3: adds a sanity-range filter to catch land/placeholder points that
+slip past the NaN check (some real-world NetCDF files mark land with a
+fill value like -32767 or 0 instead of a clean NaN) ---
 
 Input  (from data_raw/):
     data_raw/model_output.nc   (from Copernicus Marine `subset` command)
@@ -43,7 +33,6 @@ os.makedirs("data_processed", exist_ok=True)
 # ---------------------------------------------------------------
 ds = xr.open_dataset("data_raw/model_output.nc")
 
-# --- Real CMEMS dimension/variable names ---
 TEMP_VAR = "thetao"
 SAL_VAR = "so"
 LAT_DIM = "latitude"
@@ -51,18 +40,21 @@ LON_DIM = "longitude"
 DEPTH_DIM = "depth"
 TIME_DIM = "time"
 
+# Real-world sanity bounds -- anything outside these is almost certainly
+# a land/fill-value point, not a real ocean reading, regardless of
+# whether it was properly marked as NaN in the file.
+TEMP_MIN, TEMP_MAX = -3.0, 40.0
+SAL_MIN, SAL_MAX = 2.0, 45.0
+
 model_records = []
 times = ds[TIME_DIM].values
 depths = ds[DEPTH_DIM].values
 lats = ds[LAT_DIM].values
 lons = ds[LON_DIM].values
 
-# NOTE: real-world grids can be large (361 x 301 here). To keep the
-# JSON small and fast for a hackathon demo, we downsample the lat/lon
-# grid by taking every Nth point. Increase STEP for an even smaller
-# file, decrease for more detail (but slower frontend rendering).
-STEP = 6
+STEP = 6  # downsample the lat/lon grid for a lighter, faster-rendering JSON
 
+skipped = 0
 for ti, t in enumerate(times):
     t_str = pd.to_datetime(t).strftime("%Y-%m-%d")
     for di, d in enumerate(depths):
@@ -72,9 +64,17 @@ for ti, t in enumerate(times):
             for loi in range(0, len(lons), STEP):
                 temp_val = temp_slice[lai, loi]
                 sal_val = sal_slice[lai, loi]
-                # Skip land / missing-data points (NaN over land masks)
+
                 if pd.isna(temp_val) or pd.isna(sal_val):
+                    skipped += 1
                     continue
+                if not (TEMP_MIN <= temp_val <= TEMP_MAX):
+                    skipped += 1
+                    continue
+                if not (SAL_MIN <= sal_val <= SAL_MAX):
+                    skipped += 1
+                    continue
+
                 model_records.append({
                     "time": t_str,
                     "depth": round(float(d), 1),
@@ -86,19 +86,15 @@ for ti, t in enumerate(times):
 
 with open("data_processed/model_grid.json", "w") as f:
     json.dump(model_records, f)
-print(f"Wrote data_processed/model_grid.json ({len(model_records)} grid points)")
+print(f"Wrote data_processed/model_grid.json ({len(model_records)} grid points, {skipped} land/invalid points skipped)")
 
 ds.close()
 
 # ---------------------------------------------------------------
 # 2. ARGO / GLIDER: CSV -> JSON
 # ---------------------------------------------------------------
-# Real INCOIS ERDDAP CSV format:
-#   Row 1: column names (PLATFORM_NUMBER, time, latitude, longitude, PRES, TEMP, PSAL)
-#   Row 2: units (skip this row when reading!)
 argo_df = pd.read_csv("data_raw/argo_floats.csv", skiprows=[1])
 
-# Rename real ERDDAP columns to the simple names the rest of the code expects
 argo_df = argo_df.rename(columns={
     "PLATFORM_NUMBER": "float_id",
     "latitude": "lat",
@@ -109,13 +105,11 @@ argo_df = argo_df.rename(columns={
     "time": "time",
 })
 
-# Keep only the columns we need, drop rows with missing key values
 needed_cols = ["float_id", "lat", "lon", "depth", "temperature", "salinity", "time"]
 argo_df = argo_df[[c for c in needed_cols if c in argo_df.columns]].dropna(
     subset=["temperature", "salinity", "depth"]
 )
 
-# Normalize time to just the date (so it can line up with model_grid.json's "time")
 argo_df["time"] = pd.to_datetime(argo_df["time"]).dt.strftime("%Y-%m-%d")
 argo_df["float_id"] = argo_df["float_id"].astype(str)
 
@@ -126,7 +120,7 @@ with open("data_processed/argo_profiles.json", "w") as f:
 print(f"Wrote data_processed/argo_profiles.json ({len(argo_records)} observation points)")
 
 # ---------------------------------------------------------------
-# 3. META: available times/depths so the frontend can build sliders
+# 3. META
 # ---------------------------------------------------------------
 meta = {
     "times": sorted(set(r["time"] for r in model_records)),
