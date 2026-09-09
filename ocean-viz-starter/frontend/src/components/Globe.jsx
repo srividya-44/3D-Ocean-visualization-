@@ -3,7 +3,7 @@ import * as Cesium from "cesium";
 import "cesium/Build/Cesium/Widgets/widgets.css";
 
 // Get a free token from https://ion.cesium.com/tokens and paste it here.
-Cesium.Ion.defaultAccessToken ="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6Ii1NSHl1d0FtaWZNRXFubW0iLCJqdGkiOiJhMzY1YWZlOC01OTU0LTRmYmQtYjE1Yi0zN2U5Y2ZhNjEzZDIiLCJpZCI6NDg0MzM1LCJpc3MiOiJodHRwczovL2FwaS5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3ODg5MzU2Mjh9.k89nvJ8OiPUJx2Fqno85hfB_xUoyYtdbdO4jRv-e5-k";
+Cesium.Ion.defaultAccessToken = import.meta.env.VITE_CESIUM_TOKEN;
 
 const API_BASE = "http://localhost:8000";
 
