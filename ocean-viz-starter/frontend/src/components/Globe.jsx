@@ -1,20 +1,15 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useImperativeHandle, forwardRef } from "react";
 import * as Cesium from "cesium";
 import "cesium/Build/Cesium/Widgets/widgets.css";
 
-// Get a free token from https://ion.cesium.com/tokens and paste it here.
 Cesium.Ion.defaultAccessToken = import.meta.env.VITE_CESIUM_TOKEN;
-
 const API_BASE = import.meta.env.VITE_API_BASE;
 
-// Turn a temperature value into a color: blue (cold) -> yellow -> red (hot).
-// min/max are computed dynamically per-slice (see loadTemperatureLayer)
-// so the color spread is always meaningful, whether you're looking at a
-// warm surface layer (26-31C) or a cold deep layer (5-10C).
+// Target camera destination matching the satellite globe perspective in the reference screenshot:
+const DEFAULT_CAMERA_POS = Cesium.Cartesian3.fromDegrees(68.0, 14.0, 5_800_000);
+
 function temperatureToColor(temp, min, max) {
   const t = Math.min(1, Math.max(0, (temp - min) / (max - min || 1)));
-  // Blue -> Cyan -> Yellow -> Red gradient (more informative than plain
-  // red-to-blue for a narrow real-world range like ocean surface temps)
   let r, g, b;
   if (t < 0.5) {
     const k = t / 0.5;
@@ -30,38 +25,112 @@ function temperatureToColor(temp, min, max) {
   return Cesium.Color.fromBytes(r, g, Math.max(0, b), 210);
 }
 
-export default function Globe({ time, depth, onFloatClick, onGridClick }) {
+function salinityToColor(sal, min, max) {
+  const t = Math.min(1, Math.max(0, (sal - min) / (max - min || 1)));
+  let r, g, b;
+  if (t < 0.5) {
+    const k = t / 0.5;
+    r = Math.round(0 + k * 30);
+    g = Math.round(150 + k * 80);
+    b = Math.round(180 - k * 30);
+  } else {
+    const k = (t - 0.5) / 0.5;
+    r = Math.round(30 + k * 215);
+    g = Math.round(230 + k * 10);
+    b = Math.round(150 - k * 110);
+  }
+  return Cesium.Color.fromBytes(r, g, b, 210);
+}
+
+const Globe = forwardRef(function Globe(
+  {
+    time,
+    depth,
+    selectedPoint,
+    variable = "temperature",
+    showGridBoxes = true,
+    showArgoFloats = true,
+    voxelScale = 1.0,
+    depthExaggeration = 50,
+    onFloatClick,
+    onGridClick,
+    onPointsLoaded,
+  },
+  ref
+) {
   const containerRef = useRef(null);
   const viewerRef = useRef(null);
   const modelEntitiesRef = useRef([]);
   const argoEntitiesRef = useRef([]);
+  const focusBoxRef = useRef(null);
 
+  // Expose camera controls to parent via ref
+  useImperativeHandle(ref, () => ({
+    zoomIn: () => {
+      const viewer = viewerRef.current;
+      if (!viewer) return;
+      const camera = viewer.camera;
+      const height = camera.positionCartographic.height;
+      camera.zoomIn(Math.max(100000, height * 0.35));
+    },
+    zoomOut: () => {
+      const viewer = viewerRef.current;
+      if (!viewer) return;
+      const camera = viewer.camera;
+      const height = camera.positionCartographic.height;
+      camera.zoomOut(Math.max(100000, height * 0.35));
+    },
+    resetView: () => {
+      const viewer = viewerRef.current;
+      if (!viewer) return;
+      viewer.camera.flyTo({
+        destination: DEFAULT_CAMERA_POS,
+        duration: 1.2,
+      });
+    },
+  }));
+
+  // Initialize Cesium Viewer with default satellite globe & selection indicator
   useEffect(() => {
+    if (!containerRef.current) return;
+
     const viewer = new Cesium.Viewer(containerRef.current, {
       timeline: false,
       animation: false,
       baseLayerPicker: false,
       geocoder: false,
-      homeButton: true,
+      homeButton: false,
       sceneModePicker: false,
       navigationHelpButton: false,
       fullscreenButton: false,
+      selectionIndicator: true, // Enables green target focus reticle
+      infoBox: false,
     });
 
+    // Set camera to frame the globe as shown in the reference image
     viewer.camera.setView({
-      destination: Cesium.Cartesian3.fromDegrees(85.0, 15.0, 1_500_000),
+      destination: DEFAULT_CAMERA_POS,
     });
+
+    // Ensure atmosphere and earth lighting match satellite globe
+    viewer.scene.globe.showGroundAtmosphere = true;
+    viewer.scene.globe.enableLighting = false;
 
     viewerRef.current = viewer;
 
-    loadArgoFloats(viewer, onFloatClick).then((entities) => {
+    loadArgoFloats(viewer, depthExaggeration, onFloatClick).then((entities) => {
       argoEntitiesRef.current = entities;
+      entities.forEach((e) => (e.show = showArgoFloats));
     });
 
     const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
     handler.setInputAction((movement) => {
       const picked = viewer.scene.pick(movement.position);
       if (!Cesium.defined(picked) || !picked.id) return;
+
+      // Activate Cesium's green selection focus reticle on the picked entity
+      viewer.selectedEntity = picked.id;
+
       if (picked.id.floatId) {
         onFloatClick(picked.id.floatId);
       } else if (picked.id.gridPoint) {
@@ -76,9 +145,60 @@ export default function Globe({ time, depth, onFloatClick, onGridClick }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Update Argo floats visibility
+  useEffect(() => {
+    argoEntitiesRef.current.forEach((e) => {
+      e.show = showArgoFloats;
+    });
+  }, [showArgoFloats]);
+
+  // Update Grid boxes visibility
+  useEffect(() => {
+    modelEntitiesRef.current.forEach((e) => {
+      e.show = showGridBoxes;
+    });
+  }, [showGridBoxes]);
+
+  // Update 3D focus box & selection reticle whenever selectedPoint changes
   useEffect(() => {
     const viewer = viewerRef.current;
     if (!viewer) return;
+
+    if (focusBoxRef.current) {
+      viewer.entities.remove(focusBoxRef.current);
+      focusBoxRef.current = null;
+    }
+
+    if (!selectedPoint) return;
+
+    const focusEntity = viewer.entities.add({
+      name: `Focus: ${selectedPoint.lat.toFixed(2)}°N, ${selectedPoint.lon.toFixed(2)}°E`,
+      position: Cesium.Cartesian3.fromDegrees(
+        selectedPoint.lon,
+        selectedPoint.lat,
+        -selectedPoint.depth * depthExaggeration
+      ),
+      box: {
+        dimensions: new Cesium.Cartesian3(
+          28000 * voxelScale,
+          28000 * voxelScale,
+          14000 * voxelScale
+        ),
+        material: Cesium.Color.LIME.withAlpha(0.2),
+        outline: true,
+        outlineColor: Cesium.Color.LIME,
+        outlineWidth: 3,
+      },
+    });
+
+    focusBoxRef.current = focusEntity;
+    viewer.selectedEntity = focusEntity;
+  }, [selectedPoint, depthExaggeration, voxelScale]);
+
+  // Load grid slice data when time, depth, variable, or exaggeration changes
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewer || !time || depth === undefined) return;
 
     fetch(`${API_BASE}/api/temperature?time=${time}&depth=${depth}`)
       .then((res) => res.json())
@@ -86,73 +206,99 @@ export default function Globe({ time, depth, onFloatClick, onGridClick }) {
         modelEntitiesRef.current.forEach((e) => viewer.entities.remove(e));
         modelEntitiesRef.current = [];
 
-        if (gridPoints.length === 0) return;
+        if (onPointsLoaded) {
+          onPointsLoaded(gridPoints);
+        }
 
-        // Compute the ACTUAL min/max temperature in this slice, so the
-        // color gradient always spans the real range instead of clipping
-        // everything to one end (which is what caused the uniform-orange
-        // look before).
-        const temps = gridPoints.map((p) => p.temperature);
-        const min = Math.min(...temps);
-        const max = Math.max(...temps);
+        if (!gridPoints || gridPoints.length === 0) return;
+
+        const values = gridPoints.map((p) =>
+          variable === "salinity" ? p.salinity : p.temperature
+        );
+        const min = Math.min(...values);
+        const max = Math.max(...values);
 
         gridPoints.forEach((p) => {
+          const color =
+            variable === "salinity"
+              ? salinityToColor(p.salinity, min, max)
+              : temperatureToColor(p.temperature, min, max);
+
           const entity = viewer.entities.add({
-            gridPoint: p, // custom property read by the click handler
-            position: Cesium.Cartesian3.fromDegrees(p.lon, p.lat, -p.depth * 50),
+            gridPoint: p,
+            show: showGridBoxes,
+            position: Cesium.Cartesian3.fromDegrees(
+              p.lon,
+              p.lat,
+              -p.depth * depthExaggeration
+            ),
             box: {
-              dimensions: new Cesium.Cartesian3(25000, 25000, 12000),
-              material: temperatureToColor(p.temperature, min, max),
+              dimensions: new Cesium.Cartesian3(
+                25000 * voxelScale,
+                25000 * voxelScale,
+                12000 * voxelScale
+              ),
+              material: color,
               outline: false,
             },
           });
           modelEntitiesRef.current.push(entity);
         });
       })
-      .catch((err) => console.error("Failed to load temperature layer:", err));
-  }, [time, depth]);
+      .catch((err) => console.error("Failed to load ocean layer:", err));
+  }, [time, depth, variable, voxelScale, depthExaggeration, showGridBoxes, onPointsLoaded]);
 
-  return <div ref={containerRef} style={{ width: "100%", height: "100%" }} />;
-}
+  return <div ref={containerRef} className="cesium-host" />;
+});
 
-async function loadArgoFloats(viewer, onFloatClick) {
-  const listRes = await fetch(`${API_BASE}/api/argo`);
-  const floats = await listRes.json();
-  const entities = [];
+export default Globe;
 
-  for (const f of floats) {
-    const profileRes = await fetch(`${API_BASE}/api/argo/${f.float_id}`);
-    const profile = await profileRes.json();
+async function loadArgoFloats(viewer, depthExaggeration, onFloatClick) {
+  try {
+    const listRes = await fetch(`${API_BASE}/api/argo`);
+    const floats = await listRes.json();
+    const entities = [];
 
-    const positions = profile.map((p) =>
-      Cesium.Cartesian3.fromDegrees(p.lon, p.lat, -p.depth * 50)
-    );
+    for (const f of floats) {
+      const profileRes = await fetch(`${API_BASE}/api/argo/${f.float_id}`);
+      const profile = await profileRes.json();
 
-    const entity = viewer.entities.add({
-      floatId: f.float_id,
-      polyline: {
-        positions,
-        width: 6,
-        material: new Cesium.PolylineOutlineMaterialProperty({
+      const positions = profile.map((p) =>
+        Cesium.Cartesian3.fromDegrees(p.lon, p.lat, -p.depth * depthExaggeration)
+      );
+
+      const entity = viewer.entities.add({
+        floatId: f.float_id,
+        polyline: {
+          positions,
+          width: 6,
+          material: new Cesium.PolylineOutlineMaterialProperty({
+            color: Cesium.Color.YELLOW,
+            outlineWidth: 1,
+            outlineColor: Cesium.Color.BLACK,
+          }),
+        },
+        point: {
+          pixelSize: 12,
           color: Cesium.Color.YELLOW,
-          outlineWidth: 1,
-          outlineColor: Cesium.Color.BLACK,
-        }),
-      },
-      point: {
-        pixelSize: 12,
-        color: Cesium.Color.YELLOW,
-      },
-      position: positions[0],
-      label: {
-        text: f.float_id,
-        font: "12px sans-serif",
-        pixelOffset: new Cesium.Cartesian2(0, -20),
-        fillColor: Cesium.Color.WHITE,
-      },
-    });
-    entities.push(entity);
-  }
+        },
+        position: positions[0],
+        label: {
+          text: f.float_id,
+          font: "12px sans-serif",
+          pixelOffset: new Cesium.Cartesian2(0, -20),
+          fillColor: Cesium.Color.WHITE,
+          showBackground: true,
+          backgroundColor: Cesium.Color.fromBytes(10, 20, 30, 200),
+          backgroundPadding: new Cesium.Cartesian2(5, 3),
+        },
+      });
+      entities.push(entity);
+    }
 
-  return entities;
+    return entities;
+  } catch (err) {
+    console.warn("Could not load Argo floats:", err);
+    return [];
+  }
 }
