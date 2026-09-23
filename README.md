@@ -92,7 +92,7 @@ ocean-viz-starter/
 
 Navigate to the `backend` directory:
 ```bash
-cd backend
+cd ocean-viz-starter/backend
 ```
 
 Create and activate a Python virtual environment:
@@ -130,7 +130,7 @@ uvicorn main:app --reload --port 8000
 
 In a **new terminal window**, navigate to the `frontend` directory:
 ```bash
-cd frontend
+cd ocean-viz-starter/frontend
 ```
 
 Install npm packages:
@@ -139,7 +139,7 @@ npm install
 ```
 
 Configure Environment Variables (Optional):
-Create a `.env` file in `frontend/` if you wish to override default endpoints or set a Cesium Ion token:
+Create a `.env` file in `ocean-viz-starter/frontend/` if you wish to override default endpoints or set a Cesium Ion token:
 ```env
 VITE_API_BASE=http://localhost:8000
 VITE_CESIUM_TOKEN=your_cesium_ion_access_token
